@@ -1,0 +1,746 @@
+% Michael Harrison and Paolo Masci (QMUL and Newcastle University) April 2014
+%%
+% @module alaris2lnewmodes.pump.pvs
+% @author Michael Harrison and Paolo Masci (QMUL and Newcastle University)
+% @date April 2014
+% @description Theory associated with the generic pump underlying several infusion pump interfaces
+%              Maximum infusion rate, maximum and minimum vtbi, timeouts, battery maximum and minimums are parameterised
+%              Further constraints minimum infusion must be less than or equal to maximum infusion
+%              Maximum time must exceed time out
+%              Maximum battery time plus one must be less than maximum time
+%              Battery time minimum must be less than battery time maximum
+%%
+pump_th [
+   maxrate  : posnat,
+   maxinfuse: posnat,   
+   infusemin: { infusemin: posreal | infusemin <= maxinfuse },
+   timeout  : nat,
+   shorttimeout : nat,
+   maxtime  : { maxtime: posnat | maxtime > timeout },
+   bat_max : {bat_max: posnat | bat_max+1 < maxtime},
+   bat_min: {bat_min: posnat | bat_min < bat_max}
+]: THEORY
+%%
+  % @type constraints
+  % @description Further constraints relating to time outs and infusion volumes
+%%
+ BEGIN
+  ASSUMING
+    timeoutLTmaxtime: ASSUMPTION timeout < maxtime
+    shorttimeoutLTtimeout: ASSUMPTION shorttimeout < timeout
+    maxinfuseLEQmaxtime: ASSUMPTION maxinfuse <= maxtime
+  ENDASSUMING
+  IMPORTING types_and_constants_th[maxrate, maxinfuse, infusemin, timeout, shorttimeout, maxtime, bat_max, bat_min]
+
+  %-- useful lemmas ------------------------------------------------------------------
+%%
+  % @type lemmas
+  % @description These lemmas are used in proving TCCs for both this theory and the Alaris theory
+%%
+%
+  vtbi_over_rate_lemma: LEMMA 
+    FORALL(v: ivols, r: {r: irates | (NOT r = 0)}): (v / r) >= 0 
+
+  vtbi_over_time_lemma: LEMMA
+    FORALL(v: ivols, t: {t: itimes | (NOT t = 0)}): (v / t) >= 0 
+  %-----------------------------------------------------------------------------------
+
+  %-- interactor pump
+  %   attributes
+ %%
+  % @type pump
+  % @description The state associated with the pump
+  % @property {boolean} powered_on? true if the device is switched on
+  % @property {boolean} infusing? true if the device is infusing
+  % @property {irates} infusionrate current infusion rate
+  % @property {ivols} volumeinfused The volume that has been infused
+  % @property {ivols} vtbi The volume that is to be infused
+  % @property {itimes} time the time to conclusion of infusion
+  % @property {itimes} elapsedtime Elapsed time since start of infusion
+  % @property {irates} kvorate minimum infusion rate to keep vein open
+  % @property {pausetime} elapse Time since start of infusion pump pause
+  % @property {boolean} kvoflag true if VTBI exhausted and keeping vein open
+  % @property {boolean} ac_connect true if mains power connected
+  % @property {itimes} battery time left in the battery
+  % @property {boolean} set_fitted true if giving set has been fitted
+  %%
+  pump: TYPE = [#
+    powered_on? : boolean,
+    infusing? : boolean,
+    infusionrate   : irates,    
+    volumeinfused  : ivols,     
+    vtbi           : ivols,     
+    time           : itimes, 
+    elapsedtime    : itimes,    
+    kvorate        : irates,
+    elapse         : pausetime,
+    kvoflag        : boolean,
+    ac_connect     : boolean,
+    battery        : itimes, 
+    set_fitted     : boolean  
+  #]
+%%
+  % @function init?
+  % @description predicate that initialises the pump state
+  % @param {pump} st The state of the pump device
+  % @returns {bool} n True when state initialised - power off and giving set not fitted
+  % @memberof module: pump_th
+  %%
+  init?(st: pump): bool =
+     powered_on?(st) = FALSE & infusing?(st) = FALSE & infusionrate(st) = 0 & volumeinfused(st) = 0 &
+     vtbi(st) = 0 & elapse(st) = 0 & NOT kvoflag(st) & elapsedtime(st) = 0 & time(st)=0 &
+     kvorate(st)=infusemin & battery(st) = bat_max & set_fitted(st)=TRUE
+%%
+  % @function mains_switch
+  % @description Turns mains power on or off
+  % @param {pump} st the device
+  % @returns {pump} State with ac_connect inverted and time elapsed since last action set to 0
+  % @memberof module: pump_th
+%%
+  
+  mains_switch(st: pump): pump =
+      st WITH [ac_connect := NOT ac_connect(st),
+               elapse := 0]
+
+%%
+  % @function connect_set
+  % @description Connects the giving set
+  % @param {pump} st the device
+  % @returns {pump} State with set_fitted set to true
+  % @memberof module: pump_th
+%%
+  connect_set(st: pump): pump =
+      st WITH [set_fitted := TRUE]
+
+%%
+  % @function on
+  % @description Turns the device on or off
+  % @param {pump} st the device
+  % @returns {pump} state if off then state set to powered on and paused, the elapsed time since last action set to zero, keep vein open mode set to false; if on then powered_on set to false and infusing set to false
+  % @memberof module: pump_th
+%%
+
+  on(st: pump): pump=
+    COND NOT powered_on?(st)
+           -> st WITH [ powered_on? := TRUE,
+                        infusing? := FALSE,
+                        elapse := 0,
+                        kvoflag := FALSE],  
+
+         powered_on?(st) 
+           -> st WITH [ powered_on? := FALSE, infusing? := FALSE ] 
+    ENDCOND
+
+%%
+  % @function per_start
+  % @description Predicate that specifies when start action permitted
+  % @param {pump} st the device
+  % @returns {boolean} True if not infusing and powered on and the infusion rate is non-zero
+  % @memberof module: pump_th
+%%
+
+  per_start(st: pump): bool = NOT infusing?(st) & powered_on?(st) & (infusionrate(st) /= 0)
+
+%%
+  % @function start
+  % @description Starts the pump
+  % @param {(per_start)} sub-domain of pump state that satisfies per_start
+  % @returns {pump} start starts infusing depending on  whether keep vein open mode, and whether vtbi is non-zero
+  % @memberof module: pump_th
+%%
+
+  start(st: (per_start)): pump =
+    COND 
+          kvoflag(st) & (vtbi(st) /= 0 ) 
+            -> st WITH [ infusing? := TRUE,
+                        kvoflag := FALSE ],
+          kvoflag(st) & (vtbi(st) = 0) 
+            -> st WITH [ infusing? := TRUE ],
+          NOT kvoflag(st) & ((vtbi(st) = 0) OR (infusionrate(st) = 0))
+            -> st WITH [ infusing? := FALSE ],
+          NOT kvoflag(st) & (vtbi(st) /= 0)  
+            -> st WITH [ infusing? := TRUE ]
+    ENDCOND
+
+%%
+  % @function per_pause
+  % @description Predicate indicates that pause is permitted
+  % @param {pump} st the device
+  % @returns {boolean} returns true if switched on and infusing
+  % @memberof module: pump_th
+%%
+  per_pause(st: pump): bool = infusing?(st)  & powered_on?(st)
+
+%%
+  % @function pause
+  % @description Pauses the pump when infusing
+  % @param {pump} st the device
+  % @returns {pump} State with infusing? false and time elapsed since last action set to 0
+  % @memberof module: pump_th
+%%
+  pause(st: pump): pump =
+    IF per_pause(st)
+     THEN st WITH [ infusing? := FALSE, elapse := 0 ]
+    ELSE st ENDIF
+
+
+ 
+%%
+  % @function per_tick
+  % @description Predicate that specifies when tick is permitted
+  % @param {pump} st the device
+  % @returns {boolean} true if powered on and if not infusing implies elapse does not exceed the maximum
+  % @memberof module: pump_th
+%%
+  per_tick(st: pump): boolean =  powered_on?(st) & (NOT infusing?(st) IMPLIES elapse(st) < maxtime)
+%%
+  % @function tick
+  % @description Indicates the evolution of the process
+  % @param {pump} st the device
+  % @returns {pump} State with updates that depend on the state of the device
+  % @memberof module: pump_th
+%%
+
+%%
+ % @description Case infusing and infusion rate less than vtbi
+%%
+  tick_case_infuse_and_infusionrateLvtbi
+    (st: {st: pump | infusing?(st) & (vtbi(st) - infusionrate(st)) > 0}): pump =
+            st WITH [ vtbi          := vtbi(st) - infusionrate(st),
+                      time          := COND infusionrate(st) = 0 -> 0,
+		      		            ELSE -> (vtbi(st) - infusionrate(st)) / infusionrate(st) ENDCOND,
+                      volumeinfused := COND volumeinfused(st) + infusionrate(st) <= maxinfuse -> volumeinfused(st) + infusionrate(st),
+		      		            ELSE -> volumeinfused(st) ENDCOND,
+                      elapsedtime   := COND elapsedtime(st) + 1 < maxtime -> elapsedtime(st) + 1,
+                                            ELSE -> elapsedtime(st) ENDCOND, 
+                      battery := COND
+                                   ac_connect(st) & (battery(st) < bat_max) -> battery(st) + 1,
+                                   NOT ac_connect(st) & (battery(st) - 1 > 0) -> battery(st) - 1,
+                                   ELSE -> battery(st)
+                                 ENDCOND ]
+                                   
+%%
+ % @description Case infusing and infusion rate greater than or equal to vtbi and not in KVO mode
+%%
+  tick_case_infuse_and_infusionrateGEvtbi_NOTkvoflag
+    (st: {st: pump | infusing?(st) & infusionrate(st) >= vtbi(st) & NOT kvoflag(st)}): pump =
+            st WITH [ vtbi := 0,
+                      time := 0,
+                      kvoflag := TRUE,
+		      volumeinfused := COND volumeinfused(st) + vtbi(st) <= maxinfuse -> volumeinfused(st) + vtbi(st),
+		                            ELSE -> volumeinfused(st) ENDCOND,
+                      elapsedtime   := COND elapsedtime(st) < maxtime - 1 -> elapsedtime(st) + 1,
+                                            ELSE -> elapsedtime(st) ENDCOND,
+                      kvorate       := COND infusionrate(st) <  infusemin -> infusionrate(st),
+                                            infusionrate(st) >= infusemin -> infusemin ENDCOND,
+                      battery := COND
+                                   ac_connect(st) & (battery(st) < bat_max) -> battery(st) + 1,
+                                   ac_connect(st) & (battery(st) >= bat_max) -> bat_max,
+                                   NOT ac_connect(st) & (battery(st)-1 > 0) -> battery(st) - 1,
+                                   NOT ac_connect(st) & NOT (battery(st)-1 > 0) -> 0 
+                                 ENDCOND ]
+
+%%
+ % @description Case infusing and infusion rate greater than or equal to vtbi and in KVO mode
+%%
+
+  tick_case_infuse_and_infusionrateGEvtbi_kvoflag
+    (st: {st: pump | infusing?(st) & infusionrate(st) >= vtbi(st) & kvoflag(st)}): pump =
+            st WITH [ % MOD
+                      % volumeinfused := volumeinfused(st) + kvorate(st),
+                      % elapsedtime   := elapsedtime(st) + 1,
+		      volumeinfused := COND volumeinfused(st) + kvorate(st) <= maxinfuse -> volumeinfused(st) + kvorate(st), 
+		      		            ELSE -> volumeinfused(st) ENDCOND,
+                      elapsedtime   := COND elapsedtime(st) + 1 < maxtime -> elapsedtime(st) + 1,
+                                            ELSE -> elapsedtime(st) ENDCOND,
+                      battery := COND
+                                   ac_connect(st) & (battery(st) < bat_max) -> battery(st) + 1,
+                                   ac_connect(st) & (battery(st) >= bat_max) -> bat_max,
+                                   NOT ac_connect(st) & (battery(st) - 1 > 0) -> battery(st) - 1,
+                                   NOT ac_connect(st) & NOT (battery(st)-1 > 0) -> 0 
+                                 ENDCOND ]
+
+%%
+  % @function tick
+  % @description shows the cases
+  % @param {pump} st the device
+  % @returns {pump} Cases dealt with by function defined above except when not infusing when elapse is incremented
+  % @memberof module: pump_th
+%%
+
+  tick(st: {st: pump | per_tick(st)}): pump =
+        COND
+          infusing?(st) & infusionrate(st) < vtbi(st)                -> tick_case_infuse_and_infusionrateLvtbi(st),
+          infusing?(st) & infusionrate(st) >= vtbi(st) & NOT kvoflag(st) -> tick_case_infuse_and_infusionrateGEvtbi_NOTkvoflag(st),
+          infusing?(st) & infusionrate(st) >= vtbi(st) & kvoflag(st)     -> tick_case_infuse_and_infusionrateGEvtbi_kvoflag(st),
+          NOT infusing?(st)                             -> st WITH [ elapse := elapse(st) + 1 ]
+        ENDCOND
+%%
+% @description the following are used by the main module to access and update attributes local to the pump module and mirror similar actions defined in the MAL model
+%%
+
+%%
+  % @function resetElapsed
+  % @description resets the elapsed time
+  % @param {pump} st the device
+  % @returns {pump} elapse is set to zero
+  % @memberof module: pump_th
+%%
+  resetElapsed(st: pump): pump = st WITH [ elapse :=0 ]
+
+%%
+  % @function clearVolumeinfused
+  % @description resets the volume infused and elapsed time
+  % @param {pump} st the device
+  % @returns {pump} volumeinfused and elapse set to zero
+  % @memberof module: pump_th
+%%
+
+  clearVolumeinfused(st: pump): pump = st WITH [ volumeinfused := 0, elapse := 0 ]
+
+%%
+  % @function clearkvoflag
+  % @description turns KVO mode off and pauses the device
+  % @param {pump} st the device
+  % @returns {pump} KVO set to false, infusing set to false, elapse is set to zero
+  % @memberof module: pump_th
+%%
+  clearkvoflag(st: pump): pump = st WITH [ kvoflag := FALSE, elapse := 0, infusing? := FALSE ]
+%%
+  % @function maxvtbi
+  % @description sets vtbi to the maximum value and time is calculated based on infusion rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+  maxvtbi(st: pump): pump = st WITH [ vtbi := maxinfuse, 
+                                      time := COND infusionrate(st) = 0 -> 0,
+				      	      	   ELSE -> maxinfuse / infusionrate(st) ENDCOND, 
+                                      elapse := 0, kvoflag := FALSE ]
+
+%%
+  % @function maxhvtbi
+  % @description sets vtbi to the maximum value and infusion rate is calculated based on time
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and KVO switched off
+  % @memberof module: pump_th
+%%
+  maxhvtbi(st: pump): pump = st WITH [ vtbi := maxinfuse, 
+                                       infusionrate := IF time(st) = 0 THEN 0
+				       		       ELSE maxinfuse / time(st) ENDIF, 
+                                       elapse := 0, 
+                                       kvoflag := FALSE ]
+
+%%
+  % @function zerovtbi
+  % @description sets vtbi to zero and time is also set to zero
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  zerovtbi(st: pump): pump = st WITH [ vtbi := 0, 
+  	       	      	     	       time := 0,
+                                       elapse := 0, 
+                                       kvoflag := FALSE ]
+
+%%
+  % @function zerohvtbi
+  % @description sets vtbi to zero and infusion rate set to zero
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  zerohvtbi(st: pump): pump = st WITH [ vtbi    := 0, 
+                                        elapse  := 0, 
+                                        kvoflag := FALSE, 
+                                        infusionrate := 0]
+
+%%
+  % @function reset
+  % @description clears all relevant state values
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+  reset(st: pump): pump = st WITH [vtbi := 0,
+                                   elapse := 0,
+                                   kvoflag := FALSE,
+                                   time := 0,
+                                   infusionrate := 0,
+                                   volumeinfused := 0,
+                                   elapsedtime := 0,
+                                   kvorate := 0]
+
+ 
+
+%%
+  % @function pbsvtbi
+  % @description increments vtbi by constant big step, and updates time depending on infusionrate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  pbsvtbi(st: {st: pump | vtbi(st) + bigstep <= maxinfuse}): pump = 
+                             st WITH [ vtbi := vtbi(st) + bigstep,
+                                      time := IF infusionrate(st) = 0 THEN 0
+				       	       ELSE (vtbi(st) + bigstep) / infusionrate(st) ENDIF, 
+                                       elapse := 0, 
+                                       kvoflag := FALSE ]
+
+%%
+  % @function aug_vtbi
+  % @description sets vtbi to the parameter and time is calculated based on infusion rate
+  % @param {ivols} x is the new value of vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+ aug_vtbi(st: pump, v: ivols): pump =
+     st WITH [ vtbi := v,
+               time := IF infusionrate(st) = 0 THEN 0
+	       	       	  		       ELSE v / infusionrate(st) ENDIF, 
+                                       elapse := 0, 
+                                       kvoflag := FALSE]
+
+%%
+  % @function pbshvtbi
+  % @description increments vtbi by constant big step, and updates infusion rate depending on time
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  
+  pbshvtbi(st: {st: pump | vtbi(st) + bigstep <= maxinfuse}): pump =
+                             st WITH [ vtbi := vtbi(st) + bigstep, 
+                                       infusionrate := IF time(st) = 0 THEN 0
+				       		      ELSE (vtbi(st) + bigstep) / time(st) ENDIF,
+                                       elapse := 0, 
+                                       kvoflag := FALSE ]
+
+ %%
+  % @function aug_htvbi
+  % @description sets vtbi to the parameter and infusion rate is calculated based on time
+  % @param {ivols} v is the new value of vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+ aug_hvtbi(st: pump, v: ivols): pump =
+     st WITH [ vtbi := v,
+               infusionrate := IF time(st) = 0 THEN 0
+	       		       	  	       ELSE v / time(st) ENDIF, 
+                                       elapse := 0, 
+                                       kvoflag := FALSE]
+
+%%
+  % @function pivtbi
+  % @description increments vtbi by 1, and updates time depending on infusion rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+
+  pivtbi(st: {st: pump | vtbi(st) + 1 <= maxinfuse}): pump = 
+                              st WITH [ vtbi := vtbi(st) + 1, 
+                                        time := IF infusionrate(st) = 0 THEN 0
+                                                	ELSE (vtbi(st) + 1) / infusionrate(st) ENDIF, 
+                                        elapse := 0, 
+                                        kvoflag := FALSE ]
+
+%%
+  % @function pihvtbi
+  % @description increments vtbi by 1, and updates infusion rate depending on time
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  pihvtbi(st: {st: pump | vtbi(st) + 1 <= maxinfuse}): pump = 
+                             st WITH [ vtbi := vtbi(st) + 1,
+                                       infusionrate := IF time(st) = 0 THEN 0
+				       		       ELSE (vtbi(st) + 1) / time(st) ENDIF, 
+                                       elapse := 0, kvoflag := FALSE ]
+
+%%
+  % @function mbsvtbi
+  % @description decrements vtbi by constant big step, and updates time depending on infusion rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  mbsvtbi(st: {st: pump | vtbi(st) - bigstep >= 0}): pump = 
+                              st WITH [ vtbi := vtbi(st) - bigstep, 
+                                        time := IF infusionrate(st) = 0 THEN 0
+					     		ELSE (vtbi(st) - bigstep) / infusionrate(st) ENDIF,
+                                        elapse := 0 ]
+
+%%
+  % @function mbshvtbi
+  % @description decrements vtbi by constant big step, and updates infusion rate depending on time
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  mbshvtbi(st: {st: pump | vtbi(st) - bigstep >= 0}): pump = 
+                             st WITH [ vtbi := vtbi(st) - bigstep, 
+                                       infusionrate := IF time(st) = 0 THEN 0
+				       		        ELSE (vtbi(st) - bigstep) / time(st) ENDIF,
+                                       elapse := 0 ]
+%%
+  % @function mdvtbi
+  % @description decrements vtbi by 1, and updates time depending on infusion rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  mdvtbi(st: {st: pump | vtbi(st) - 1 >= 0}): pump = 
+                              st WITH [ vtbi := vtbi(st) - 1, 
+                                        time := COND infusionrate(st) = 0 -> 0,
+					     	     ELSE -> (vtbi(st) - 1) / infusionrate(st) ENDCOND, 
+                                        elapse := 0 ]
+
+%%
+  % @function mdhvtbi
+  % @description decrements vtbi by 1, and updates infusion rate depending on time
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  mdhvtbi(st: {st: pump | vtbi(st) - 1 >= 0}): pump =
+                             st WITH [ vtbi := vtbi(st) - 1, 
+                                       infusionrate := COND time(st) = 0 -> 0,
+				       		       ELSE -> (vtbi(st) - 1) / time(st) ENDCOND,
+                                       elapse := 0 ]
+
+ 
+
+%%
+  % @function zerotime
+  % @description sets time, infusion rate to zero
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+  zerotime(st: pump): pump = st WITH [ time := 0, 
+  	       	      	     	       infusionrate := 0, 
+  	       	      	     	       elapse := 0 ]
+
+%%
+  % @function maxitime
+  % @description sets time to maximum, infusion rate is calculated based on vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+  maxitime(st: pump): pump = st WITH [ time := maxtime, 
+  	       	      	     	       infusionrate := vtbi(st) / maxtime,
+                                       elapse := 0 ]
+
+%%
+  % @function pbstime
+  % @description increments time by constant big step, infusion rate calculated based on vtbi and new value of time
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+  pbstime(st: {st: pump | time(st) + bigstep <= maxtime}): pump = 
+                             st WITH [time := time(st) + bigstep, 
+			     	      infusionrate := vtbi(st) / (time(st) + bigstep),
+                                      elapse := 0 ]
+%%
+  % @function aug_time
+  % @description sets time to the parameter and infusion rate is calculated based on vtbi
+  % @param {itimes} t is the new value of time
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+  aug_time(st: pump, t: itimes): pump =
+     st WITH [ time := t,
+               infusionrate := COND (t = 0) -> 0,
+                               ELSE -> vtbi(st)/ t ENDCOND, 
+               elapse := 0]
+
+%%
+  % @function pitime
+  % @description increments time, infusion rate is calculated based on new time and vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+ 
+  pitime(st: {st: pump | time(st) + 1 <= maxtime}): pump = 
+                             st WITH [ time := time(st) + 1, 
+			     	       infusionrate := vtbi(st) / (time(st) + 1),
+                                       elapse := 0 ]
+
+%%
+  % @function mbstime
+  % @description reduces time by big step, infusion rate is calculated based on new time and vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+
+  mbstime(st: {st: pump | time(st) - bigstep >= 0}): pump = 
+                             st WITH [ time := time(st) - bigstep, 
+                                       infusionrate := COND time(st) = bigstep -> 0,
+				       		         ELSE -> vtbi(st) / (time(st) - bigstep) ENDCOND,
+                                       elapse := 0 ]
+
+%%
+  % @function mdtime
+  % @description decrements time, infusion rate is calculated based on new time and vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+
+  mdtime(st: {st: pump | time(st) - 1 >= 0}): pump = 
+                             st WITH [ time := time(st) - 1, 
+                                       infusionrate := COND time(st) = 1 -> 0,
+				       		          ELSE -> vtbi(st) / (time(st) - 1) ENDCOND,
+                                       elapse := 0 ]
+
+%%
+  % @function zerorate
+  % @description sets time, infusion rate to zero
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+
+  zerorate(st: pump): pump = st WITH [ infusionrate := 0, time := 0, elapse := 0 ]
+
+%%
+  % @function maximrate
+  % @description sets infusion rate to maximum and calculates time baed on vtbi and rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+
+  maximrate(st: pump): pump = st WITH [ infusionrate := maxrate, time := vtbi(st) / maxrate, elapse := 0 ]
+
+%%
+  % @function pbsrate
+  % @description augments infusion rate by constant big step and calculates time baed on vtbi and rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+  pbsrate(st: {st: pump | infusionrate(st) + bigstep <= maxrate}): pump = 
+                              st WITH [ infusionrate := infusionrate(st) + bigstep, 
+			      	      		time := vtbi(st) / (infusionrate(st) + bigstep),
+                                        elapse := 0 ]
+
+%%
+  % @function pirate
+  % @description increments infusion rate and calculates time based on vtbi and rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+  pirate(st: {st: pump | infusionrate(st) + 1 <= maxrate}): pump = 
+                              st WITH [ infusionrate := infusionrate(st) + 1, 
+			      	        	time := vtbi(st) / (infusionrate(st) + 1),
+                                        elapse := 0 ]
+
+%%
+  % @function aug_rate
+  % @description sets infusion rate to the parameter and time is calculated based on vtbi
+  % @param {irates} v is the new value of infusion rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  aug_rate(st: pump, v: irates): pump =
+     st WITH [ infusionrate := v,
+     	       time := COND v=0 -> 0, ELSE -> vtbi(st) / v ENDCOND,
+               elapse := 0 ]
+
+%%
+  % @function mbsrate
+  % @description decreases infusion rate by big step and calculates time based on vtbi and rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+  mbsrate(st: {st: pump | infusionrate(st) - bigstep >= 0}): pump = 
+                              st WITH [ infusionrate := infusionrate(st) - bigstep, 
+                                        time := COND infusionrate(st) = bigstep -> 0,
+					     	  ELSE -> vtbi(st) / (infusionrate(st) - bigstep) ENDCOND,
+                                        elapse := 0 ]
+
+%%
+  % @function mdrate
+  % @description decrements infusion rate and calculates time based on vtbi and rate
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero
+  % @memberof module: pump_th
+%%
+
+  mdrate(st: {st: pump | infusionrate(st) - 1 >= 0}): pump = 
+                              st WITH [ infusionrate := infusionrate(st) - 1, 
+                                        time := COND infusionrate(st) = 1 -> 0,
+					          ELSE -> vtbi(st) / (infusionrate(st) - 1) ENDCOND,
+                                        elapse := 0 ]
+
+%%
+  % @function modratevtbi
+  % @description sets infusion rate and vtbi  the parameters and time is calculated
+  % @param {irates} x is the new value of infusion rate
+  % @param {ivols} y is the new value of vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+
+  modratevtbi(x: irates, y: ivols)(st: pump): pump = st WITH [ infusionrate := x,
+                                                                time := COND x = 0 -> 0,
+								          ELSE -> y / x ENDCOND, 
+                                                               vtbi := y, elapse := 0 ]
+
+%%
+  % @function modvtbitime
+  % @description sets infusion vtbi and time  the parameters and infusion rate is calculated
+  % @param {itimes} y is the new value of time
+  % @param {ivols} x is the new value of vtbi
+  % @param {pump} st the device
+  % @returns {pump} elapse is also set to zero, and kvo switched off
+  % @memberof module: pump_th
+%%
+
+  modvtbitime(x: ivols, y: itimes)(st: pump): pump = st WITH [ infusionrate := 
+                                                                   COND y = 0 -> 0,
+								    ELSE -> x / y ENDCOND,
+                                                               time := y, vtbi := x, elapse := 0 ]
+
+  
+
+  END pump_th
+
+

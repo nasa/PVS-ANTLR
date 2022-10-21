@@ -1,3 +1,3 @@
-# pvs-antlr
+# PVS-ANTLR
 
-pvs-antlr is a toolkit for parsing and translating .pvs files containing formal specifications written in the language of the PVS verification system.
+PVS-ANTLR (PVS grammar for [ANTLR](https://www.antlr.org/)) is an open source ANTLR specification of the modeling language of the [PVS theorem proving system](https://pvs.csl.sri.com/), a state-of-the-art verification system extensively used at NASA LaRC for the verification of algorithms and protocols for safety-critical systems.

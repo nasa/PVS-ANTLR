@@ -1,0 +1,4 @@
+helloworld : theory begin
+ dummy: theorem 
+    FORALL (x: real): true ∧ true
+end helloworld
