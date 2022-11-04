@@ -3,8 +3,15 @@
  * @author Paolo Masci
  * @date 2019.12.27
  * @copyright 
- * Copyright 2019 United States Government as represented by the Administrator 
+ * Copyright 2019-2022 United States Government as represented by the Administrator 
  * of the National Aeronautics and Space Administration. All Rights Reserved.
+ *
+ * This software calls the following third-party software, which is subject to the
+ * terms and conditions of its licensor, as applicable:
+ *
+ * ANTLR (ANother Tool for Language Recognition)
+ * BSD 3-Clause
+ * https://github.com/antlr/antlr4/blob/master/LICENSE.txt
  *
  * Disclaimers
  *
